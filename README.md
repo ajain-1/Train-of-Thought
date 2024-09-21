@@ -9,5 +9,6 @@ project uses two instances of Google's Gemini Flash 1.5
 model, but this approach can be generalized to any number 
 and type of models.
 
-NOTE: Removed Agent Backtracking due to token limits.
+### Note: Removed Agent Backtracking due to token limits.
+
 Learn more at [our presentation.](https://cmu.box.com/s/xdaft9t8l1v9yvsfsb5evv2p1jfj0t43)
