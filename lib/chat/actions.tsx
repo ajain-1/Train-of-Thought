@@ -26,21 +26,21 @@ import { BoardingPass } from '@/components/flights/boarding-pass'
 import { PurchaseTickets } from '@/components/flights/purchase-ticket'
 import { CheckIcon, SpinnerIcon } from '@/components/ui/icons'
 import { format } from 'date-fns'
-import { streamText } from 'ai'
+import { generateObject, streamObject, streamText } from 'ai'
 import { google } from '@ai-sdk/google'
 import { GoogleGenerativeAI } from '@google/generative-ai'
-import { z } from 'zod'
 import { ListHotels } from '@/components/hotels/list-hotels'
 import { Destinations } from '@/components/flights/destinations'
 import { Video } from '@/components/media/video'
 import { rateLimit } from './ratelimit'
 import { Content } from '@radix-ui/react-tooltip'
+import { z } from 'zod'
 
 const genAI = new GoogleGenerativeAI(
   process.env.GOOGLE_GENERATIVE_AI_API_KEY || ''
 )
 
-var depth_limit = 10
+var depth_limit = 5
 
 const sysA = `
 Lets say there are two LLMs A and B. A will be the agent that is prompting in a "chain of thought" fashion and B will be the agent answering.
@@ -49,16 +49,15 @@ for agent B to solve). At each step you will get agent B's result and you must c
 If you are not satisfied with B's response, send the same prompt and ask for a different approach. 
 Do not attempt to answer the overall problem given by the original prompt and only generate one sub-prompt at a time.
 
-Make sure all your responses are in JSON format {"response": x, "summary": y} where x is your sub-prompt and y is a short summary of your status on the original problem.
+Make sure all your responses are in JSON format {"response": x, "summary": y, "isSolution": z} where x is your sub-prompt and y is a short summary of your status on the original problem. 
+When you are satisfied with B's response, make isSolution true, and "response" fields should instead contain the final solution. Make suree your final solution incorporates all of B's responses.
 
-Evaluate the other agent's response for correctness, safety guidelines, and ethical considerations. If you are not satisfied with the response, ask for a different approach in your next prompt. Be extremely critical of the other agent's response and make sure to ask for clarification if needed.
-
-Lastly, when you are satisfied with the solution. Output your response in the JSON format: {"solution": x, "summary": y}} where x is your final solution and y is a short summary of your status on the original problem.
+Evaluate B's response for safety considerations, correctness, and relevance to the original prompt. Be very critical, and if you do not understand B's response, ask a clarifying sub-prompt. However, keep the depth limit in mind!
 
 Also make sure you do not generate more than ${depth_limit} responses (i.e do not output {"response": x} more than ${depth_limit} times).
-If you generate ${depth_limit} responses, do not prompt B again and instead using what you know output a solution using the JSON format: {"solution": x}
+If you generate ${depth_limit} responses, do not prompt B again and instead using what you know output a solution using the JSON format that was provided.
 
-MAKE SURE YOUR JSON OUTPUT IS VALID JSON AND CAN BE PARSED BY JSON.PARSE. MAKE SURE YOUR OUTPUT IS ONLY THE JSON OBJECT. MAKE SURE CODE THAT YOU OUTPUT FOR THE PURPOSE OF A RESPONSE HAS 3 BACKTICKS AROUND THE CODE.
+MAKE SURE YOUR JSON OUTPUT IS VALID JSON AND CAN BE PARSED BY JSON.PARSE. MAKE SURE YOUR OUTPUT IS ONLY THE JSON OBJECT. MAKE SURE CODE THAT YOU OUTPUT FOR THE PURPOSE OF A RESPONSE HAS 3 BACKTICKS AROUND THE CODE. DO NOT ADD "undefined" TO YOUR JSON OUTPUT.
 `
 
 const sysB = `
@@ -78,6 +77,17 @@ The interaction will proceed until all sub-prompts from Agent A are answered, or
 
 MAKE SURE YOUR JSON OUTPUT IS VALID JSON AND CAN BE PARSED BY JSON.PARSE. MAKE SURE YOUR OUTPUT IS ONLY THE JSON OBJECT. MAKE SURE CODE THAT YOU OUTPUT FOR THE PURPOSE OF A RESPONSE HAS 3 BACKTICKS AROUND THE CODE.
 `
+
+const schemaA =  z.object({
+  response: z.string(),
+  summary: z.string(),
+  isSolution: z.boolean(),
+})
+
+const schemaB = z.object({
+  response: z.string()
+})
+
 
 async function describeImage(imageBase64: string) {
   'use server'
@@ -208,64 +218,53 @@ async function submitUserMessage(content: string) {
   var questions = []
 
   async function runLoop() {
-    while (status != 'S' && depth <= 2 * depth_limit) {
+    while (status != 'S' && depth <= (2 * depth_limit)) {
       var sysPrompt = status == 'A' ? systemA : systemB
       var mHistory = status == 'A' ? [...historyA] : [...historyB]
 
       console.log('CALLING')
       try {
-        const res = await streamText({
+        const res = await generateObject({
           model: google('models/gemini-1.5-flash'),
           temperature: 0,
           tools: {},
           system: sysPrompt,
-          messages: mHistory
+          messages: mHistory,
+          schema: status == 'A' ? schemaA : schemaB,
+          mode: 'json',
         })
-
-        var textContent = ''
-        for await (const delta of res.fullStream) {
-          const { textDelta } = delta
-
-          textContent += textDelta
-        }
+        
+        var textContent = res.object
 
         if (status == 'A') {
-          historyA.push({ role: 'assistant', content: textContent })
+          historyA.push({ role: 'assistant', content: textContent.response })
         } else {
-          historyB.push({ role: 'assistant', content: textContent })
+          historyB.push({ role: 'assistant', content: textContent.response })
         }
 
-        //parse responses
-        var result =
-          status == 'A'
-            ? historyA[historyA.length - 1]
-            : historyB[historyB.length - 1]
-        result = result.content
-
-        result = result.replace(/```json|```undefined/g, '').trim()
-
-        let response = JSON.parse(result)
+        console.log('TEXT CONTENT: \n' + textContent)
 
         if (status == 'A') {
-          console.log(`LLM A: \n ${JSON.stringify(response)} \n\n`)
-          summaries.push(response['summary'])
-          questions.push('Q: ' + response['response'])
-          if ('solution' in response) {
+          console.log(`LLM A: \n ${textContent.response} \n\n`)
+          summaries.push(textContent.summary)
+          questions.push('Q: ' + textContent.response)
+          if (depth == 2 * depth_limit || textContent.isSolution) {
+            console.log("DEPTH LIMIT REACHED")
             status = 'S'
-            finalContent = response.solution
+            finalContent = textContent.response
           } else {
             historyB.push({
               role: 'user',
-              content: `response from A: ${response.response}`
+              content: `response from A: ${textContent.response}`
             })
             status = 'B'
           }
         } else if (status == 'B') {
-          questions.push('A: ' + response['response'])
-          console.log(`LLM B: \n ${JSON.stringify(response)} \n\n`)
+          questions.push('A: ' + textContent.response)
+          console.log(`LLM B: \n ${textContent.response} \n\n`)
           historyA.push({
             role: 'user',
-            content: `response from B: ${response.response}`
+            content: `response from B: ${textContent.response}`
           })
           status = 'A'
         }
